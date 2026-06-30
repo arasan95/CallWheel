@@ -1,6 +1,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use std::{
+    collections::HashMap,
     fs,
     path::PathBuf,
     sync::{
@@ -26,31 +27,39 @@ use serde::{Deserialize, Serialize};
 #[cfg(target_os = "windows")]
 use windows::{
     Win32::{
-        Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
+        Foundation::{COLORREF, CloseHandle, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
         Graphics::Gdi::{
-            CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateCompatibleBitmap,
-            CreateCompatibleDC, CreateEllipticRgn, CreateFontW, CreatePen, CreateSolidBrush,
-            DEFAULT_CHARSET, DEFAULT_PITCH, DT_CENTER, DT_END_ELLIPSIS, DT_SINGLELINE, DT_VCENTER,
-            DeleteObject, DrawTextW, Ellipse, FW_BOLD, FW_NORMAL, FillRect, GetDC, HALFTONE, HDC,
-            HFONT, LineTo, MoveToEx, OUT_DEFAULT_PRECIS, PS_SOLID, ReleaseDC, SetBkMode,
-            SetStretchBltMode, SetTextColor, SetWindowRgn, SRCCOPY, StretchBlt, TRANSPARENT,
+            BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
+            CreateCompatibleBitmap, CreateCompatibleDC, CreateDIBSection, CreateEllipticRgn,
+            CreateFontW, CreatePen, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH,
+            DIB_RGB_COLORS, DT_CENTER, DT_END_ELLIPSIS, DT_SINGLELINE, DT_VCENTER, DeleteObject,
+            DrawTextW, Ellipse, FW_BOLD, FW_NORMAL, FillRect, GetDC, HALFTONE, HDC, HFONT, LineTo,
+            MoveToEx, OUT_DEFAULT_PRECIS, PS_SOLID, ReleaseDC, SRCCOPY, SetBkMode,
+            SetStretchBltMode, SetTextColor, SetWindowRgn, StretchBlt, TRANSPARENT,
+        },
+        Media::Audio::{PlaySoundW, SND_ASYNC, SND_FILENAME},
+        System::Threading::{
+            OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+            QueryFullProcessImageNameW,
         },
         UI::{
-            HiDpi::{GetDpiForSystem, SetProcessDpiAwareness, PROCESS_PER_MONITOR_DPI_AWARE},
+            HiDpi::{GetDpiForSystem, PROCESS_PER_MONITOR_DPI_AWARE, SetProcessDpiAwareness},
             Input::KeyboardAndMouse::{
                 GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
                 KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, SendInput, VK_RBUTTON,
             },
+            Shell::ExtractIconExW,
             WindowsAndMessaging::{
-                CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow,
-                FindWindowW, GWL_EXSTYLE, GetWindowLongPtrW, HWND_TOPMOST, LWA_ALPHA,
+                CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DI_NORMAL, DefWindowProcW, DestroyIcon,
+                DestroyWindow, DrawIconEx, FindWindowW, GWL_EXSTYLE, GetForegroundWindow,
+                GetWindowLongPtrW, GetWindowThreadProcessId, HICON, HWND_TOPMOST, LWA_ALPHA,
                 RegisterClassW, SW_HIDE, SWP_NOACTIVATE, SWP_SHOWWINDOW,
                 SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, ShowWindow, WNDCLASSW,
                 WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
             },
         },
     },
-    core::PCWSTR,
+    core::{PCWSTR, PWSTR},
 };
 
 const DIRECTIONS_8: [Direction; 8] = [
@@ -87,6 +96,10 @@ const SELECTION_EFFECT_MS: u64 = 120;
 
 fn default_true() -> bool {
     true
+}
+
+fn default_wheel_item_radius() -> f32 {
+    49.0
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -257,16 +270,52 @@ fn t(lang: Language, ja: &'static str, en: &'static str) -> &'static str {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+enum SelectionSoundKind {
+    Subtle,
+    Koto,
+    Soft,
+    #[default]
+    Click,
+    Confirm,
+    Alert,
+}
+
+impl SelectionSoundKind {
+    fn label_lang(self, lang: Language) -> &'static str {
+        t(
+            lang,
+            match self {
+                SelectionSoundKind::Subtle => "控えめ",
+                SelectionSoundKind::Koto => "コト",
+                SelectionSoundKind::Soft => "ソフト",
+                SelectionSoundKind::Click => "クリック",
+                SelectionSoundKind::Confirm => "決定",
+                SelectionSoundKind::Alert => "通知",
+            },
+            match self {
+                SelectionSoundKind::Subtle => "Subtle",
+                SelectionSoundKind::Koto => "Koto",
+                SelectionSoundKind::Soft => "Soft",
+                SelectionSoundKind::Click => "Click",
+                SelectionSoundKind::Confirm => "Confirm",
+                SelectionSoundKind::Alert => "Alert",
+            },
+        )
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct WheelProfile {
+struct KeyProfile {
     name: String,
     hotkey: String,
     #[serde(default)]
     direction_mode: DirectionMode,
+    #[serde(default)]
     phrases: Vec<String>,
 }
 
-impl WheelProfile {
+impl KeyProfile {
     fn default_lane() -> Self {
         Self {
             name: "レーン報告".to_owned(),
@@ -305,11 +354,41 @@ impl WheelProfile {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+struct WheelProfile {
+    name: String,
+    #[serde(default)]
+    target_process_paths: Vec<String>,
+    #[serde(default)]
+    keys: Vec<KeyProfile>,
+    #[serde(default, skip_serializing)]
+    hotkey: String,
+    #[serde(default, skip_serializing)]
+    direction_mode: DirectionMode,
+    #[serde(default, skip_serializing)]
+    phrases: Vec<String>,
+}
+
+impl WheelProfile {
+    fn default_game() -> Self {
+        Self {
+            name: "デフォルト".to_owned(),
+            target_process_paths: Vec::new(),
+            keys: vec![KeyProfile::default_lane(), KeyProfile::default_macro()],
+            hotkey: String::new(),
+            direction_mode: DirectionMode::Eight,
+            phrases: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 struct AppConfig {
     profiles: Vec<WheelProfile>,
     dead_zone: f32,
     wheel_radius: f32,
+    #[serde(default = "default_wheel_item_radius")]
+    wheel_item_radius: f32,
     #[serde(default, rename = "direction_mode", skip_serializing)]
     legacy_direction_mode: Option<DirectionMode>,
     output_mode: OutputMode,
@@ -319,21 +398,25 @@ struct AppConfig {
     #[serde(default = "default_true")]
     selection_sound: bool,
     #[serde(default)]
+    selection_sound_kind: SelectionSoundKind,
+    #[serde(default)]
     language: Language,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            profiles: vec![WheelProfile::default_lane(), WheelProfile::default_macro()],
+            profiles: vec![WheelProfile::default_game()],
             dead_zone: 34.0,
             wheel_radius: 132.0,
+            wheel_item_radius: default_wheel_item_radius(),
             legacy_direction_mode: None,
             output_mode: OutputMode::Clipboard,
             type_delay_min_ms: 35,
             type_delay_max_ms: 85,
             selection_animation: true,
             selection_sound: true,
+            selection_sound_kind: SelectionSoundKind::default(),
             language: Language::default(),
         }
     }
@@ -341,6 +424,7 @@ impl Default for AppConfig {
 
 struct ActiveWheel {
     profile_index: usize,
+    key_index: usize,
     key: Keycode,
     origin: Pos2,
     selected: Option<Direction>,
@@ -353,6 +437,7 @@ struct OverlaySnapshot {
     origin: Pos2,
     selected: Option<Direction>,
     wheel_radius: f32,
+    wheel_item_radius: f32,
     direction_mode: DirectionMode,
     confirmed_at: Option<Instant>,
     selection_animation: bool,
@@ -373,8 +458,12 @@ struct CallWheelApp {
     config: AppConfig,
     config_path: PathBuf,
     selected_profile: usize,
+    selected_key: usize,
+    deleted_profiles: Vec<WheelProfile>,
     toast: Option<Toast>,
     last_save_error: Option<String>,
+    preview_open: bool,
+    app_icon_textures: HashMap<String, egui::TextureHandle>,
     shared_config: Arc<Mutex<AppConfig>>,
     toast_rx: Receiver<ToastMessage>,
 }
@@ -439,13 +528,15 @@ impl NativeOverlay {
             return;
         };
 
-        let size_points = Vec2::splat(snapshot.wheel_radius * 2.0 + 190.0);
+        let outer_padding = overlay_outer_padding(snapshot.wheel_item_radius);
+        let extent_padding = overlay_extent_padding(snapshot.wheel_item_radius);
+        let size_points = Vec2::splat((snapshot.wheel_radius + extent_padding) * 2.0);
         let size_px = (size_points * pixels_per_point).round();
         let left = (snapshot.origin.x - size_px.x / 2.0).round() as i32;
         let top = (snapshot.origin.y - size_px.y / 2.0).round() as i32;
         let width = size_px.x.max(1.0).round() as i32;
         let height = size_px.y.max(1.0).round() as i32;
-        let outer_radius = (snapshot.wheel_radius + 62.0) * pixels_per_point;
+        let outer_radius = (snapshot.wheel_radius + outer_padding) * pixels_per_point;
         let margin = ((size_px.x - outer_radius * 2.0) / 2.0).round() as i32;
         let layout = NativeOverlayLayout {
             left,
@@ -664,62 +755,87 @@ fn start_wheel_worker(shared_config: Arc<Mutex<AppConfig>>, toast_tx: Sender<Toa
                     current.selected = config
                         .profiles
                         .get(current.profile_index)
-                        .map(|profile| profile.direction_mode)
+                        .and_then(|profile| profile.keys.get(current.key_index))
+                        .map(|key_profile| key_profile.direction_mode)
                         .unwrap_or_default()
                         .from_delta(mouse_pos - current.origin, config.dead_zone);
                 } else {
                     let profile_index = current.profile_index;
+                    let key_index = current.key_index;
                     let selected = current.selected;
                     let origin = current.origin;
                     active = None;
 
                     if let Some(direction) = selected
                         && let Some(profile) = config.profiles.get(profile_index)
+                        && let Some(key_profile) = profile.keys.get(key_index)
                     {
-                        let phrases = profile.phrases.clone();
+                        let phrases = key_profile.phrases.clone();
                         let phrase = phrase_for_direction(&phrases, direction).to_owned();
                         selection_effect = if config.selection_animation {
                             Some(OverlaySnapshot {
-                                profile_name: profile.name.clone(),
+                                profile_name: key_profile.name.clone(),
                                 phrases: phrases.clone(),
                                 origin,
                                 selected: Some(direction),
                                 wheel_radius: config.wheel_radius,
-                                direction_mode: profile.direction_mode,
+                                wheel_item_radius: config.wheel_item_radius,
+                                direction_mode: key_profile.direction_mode,
                                 confirmed_at: Some(Instant::now()),
                                 selection_animation: true,
                                 language: config.language,
                             })
-                            } else {
-                                None
-                            };
+                        } else {
+                            None
+                        };
 
-                            if config.selection_sound {
-                                play_select_sound();
-                            }
+                        if config.selection_sound {
+                            play_select_sound(config.selection_sound_kind);
+                        }
 
-                            if !phrase.is_empty() {
-                                spawn_output_worker(
-                                    config.output_mode,
-                                    typing_delay_range(&config),
-                                    phrase,
-                                    toast_tx.clone(),
-                                    config.language,
-                                );
-                            }
+                        if !phrase.is_empty() {
+                            spawn_output_worker(
+                                config.output_mode,
+                                typing_delay_range(&config),
+                                phrase,
+                                toast_tx.clone(),
+                                config.language,
+                            );
+                        }
                     }
                 }
             } else {
-                for (index, profile) in config.profiles.iter().enumerate() {
-                    if let Some(key) = keycode_from_name(&profile.hotkey)
-                        && keys.contains(&key)
-                    {
-                        active = Some(ActiveWheel {
-                            profile_index: index,
-                            key,
-                            origin: mouse_pos,
-                            selected: None,
-                        });
+                let foreground_process_path = foreground_process_path();
+                let scoped_profile_matches = config.profiles.iter().any(|profile| {
+                    profile_has_process_targets(profile)
+                        && profile_matches_process_path(profile, &foreground_process_path)
+                });
+
+                for (profile_index, profile) in config.profiles.iter().enumerate() {
+                    if scoped_profile_matches && !profile_has_process_targets(profile) {
+                        continue;
+                    }
+
+                    if !profile_matches_process_path(profile, &foreground_process_path) {
+                        continue;
+                    }
+
+                    for (key_index, key_profile) in profile.keys.iter().enumerate() {
+                        if let Some(key) = keycode_from_name(&key_profile.hotkey)
+                            && keys.contains(&key)
+                        {
+                            active = Some(ActiveWheel {
+                                profile_index,
+                                key_index,
+                                key,
+                                origin: mouse_pos,
+                                selected: None,
+                            });
+                            break;
+                        }
+                    }
+
+                    if active.is_some() {
                         break;
                     }
                 }
@@ -731,13 +847,15 @@ fn start_wheel_worker(shared_config: Arc<Mutex<AppConfig>>, toast_tx: Sender<Toa
                     config
                         .profiles
                         .get(current.profile_index)
-                        .map(|profile| OverlaySnapshot {
-                            profile_name: profile.name.clone(),
-                            phrases: profile.phrases.clone(),
+                        .and_then(|profile| profile.keys.get(current.key_index))
+                        .map(|key_profile| OverlaySnapshot {
+                            profile_name: key_profile.name.clone(),
+                            phrases: key_profile.phrases.clone(),
                             origin: current.origin,
                             selected: current.selected,
                             wheel_radius: config.wheel_radius,
-                            direction_mode: profile.direction_mode,
+                            wheel_item_radius: config.wheel_item_radius,
+                            direction_mode: key_profile.direction_mode,
                             confirmed_at: None,
                             selection_animation: config.selection_animation,
                             language: config.language,
@@ -803,8 +921,12 @@ impl CallWheelApp {
             config,
             config_path,
             selected_profile: 0,
+            selected_key: 0,
+            deleted_profiles: Vec::new(),
             toast: None,
             last_save_error: None,
+            preview_open: false,
+            app_icon_textures: HashMap::new(),
             shared_config,
             toast_rx,
         }
@@ -838,14 +960,19 @@ impl CallWheelApp {
 
     fn draw_settings(&mut self, ui: &mut egui::Ui) {
         let lang = self.config.language;
+        let full_size = ui.available_size();
         egui::Frame::central_panel(ui.style()).show(ui, |ui| {
+            ui.set_min_size(full_size);
             ui.horizontal(|ui| {
                 ui.heading("CallWheel");
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.button(t(lang, "保存", "Save")).clicked() {
-                        self.save();
-                    }
-                });
+                let button_width = 84.0;
+                ui.add_space((ui.available_width() - button_width).max(8.0));
+                if ui
+                    .add_sized([button_width, 28.0], egui::Button::new(t(lang, "保存", "Save")))
+                    .clicked()
+                {
+                    self.save();
+                }
             });
 
             ui.label(t(
@@ -860,6 +987,14 @@ impl CallWheelApp {
                 ui.add(egui::Slider::new(&mut self.config.dead_zone, 12.0..=100.0).suffix(" px"));
                 ui.label(t(lang, "ホイール半径", "Wheel Radius"));
                 ui.add(egui::Slider::new(&mut self.config.wheel_radius, 92.0..=190.0).suffix(" px"));
+                ui.label(t(lang, "選択肢サイズ", "Item Size"));
+                ui.add(
+                    egui::Slider::new(&mut self.config.wheel_item_radius, 34.0..=78.0)
+                        .suffix(" px"),
+                );
+                if ui.button(t(lang, "プレビュー", "Preview")).clicked() {
+                    self.preview_open = true;
+                }
             });
 
             ui.horizontal(|ui| {
@@ -905,6 +1040,27 @@ impl CallWheelApp {
                     &mut self.config.selection_sound,
                     t(lang, "選択サウンド", "Selection Sound"),
                 );
+                ui.add_enabled_ui(self.config.selection_sound, |ui| {
+                    ui.label(t(lang, "音", "Sound"));
+                    egui::ComboBox::from_id_salt("selection_sound_kind_combo")
+                        .selected_text(self.config.selection_sound_kind.label_lang(lang))
+                        .show_ui(ui, |ui| {
+                            for sound in [
+                                SelectionSoundKind::Subtle,
+                                SelectionSoundKind::Koto,
+                                SelectionSoundKind::Soft,
+                                SelectionSoundKind::Click,
+                                SelectionSoundKind::Confirm,
+                                SelectionSoundKind::Alert,
+                            ] {
+                                ui.selectable_value(
+                                    &mut self.config.selection_sound_kind,
+                                    sound,
+                                    sound.label_lang(lang),
+                                );
+                            }
+                        });
+                });
             });
 
             ui.horizontal(|ui| {
@@ -947,105 +1103,256 @@ impl CallWheelApp {
 
             ui.separator();
 
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.set_min_width(180.0);
-                    for (index, profile) in self.config.profiles.iter().enumerate() {
-                        let selected = self.selected_profile == index;
+            let editor_height = ui.available_height().max(260.0);
+            ui.allocate_ui_with_layout(
+                Vec2::new(ui.available_width(), editor_height),
+                Layout::left_to_right(Align::Min),
+                |ui| {
+                ui.allocate_ui_with_layout(
+                    Vec2::new(240.0, editor_height),
+                    Layout::top_down(Align::Min),
+                    |ui| {
+                    ui.heading(t(lang, "プロファイル", "Profiles"));
+                    ui.add_space(4.0);
+                    let list_height = (ui.available_height() - 42.0).max(180.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("profile_selector_scroll")
+                        .max_height(list_height)
+                        .show(ui, |ui| {
+                            for (index, profile) in self.config.profiles.iter().enumerate() {
+                                let selected = self.selected_profile == index;
+                                if ui.selectable_label(selected, &profile.name).clicked() {
+                                    self.selected_profile = index;
+                                    self.selected_key = 0;
+                                }
+                            }
+                        });
+
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui.button(t(lang, "追加", "Add")).clicked() {
+                            let next = self.config.profiles.len() + 1;
+                            self.config.profiles.push(WheelProfile {
+                                name: t(lang, "プロファイル ", "Profile ").to_owned()
+                                    + &next.to_string(),
+                                target_process_paths: Vec::new(),
+                                keys: vec![KeyProfile::default_lane()],
+                                hotkey: String::new(),
+                                direction_mode: DirectionMode::Eight,
+                                phrases: Vec::new(),
+                            });
+                            self.selected_profile = self.config.profiles.len() - 1;
+                            self.selected_key = 0;
+                        }
+
+                        let can_restore = !self.deleted_profiles.is_empty();
                         if ui
-                            .selectable_label(selected, format!("{} ({})", profile.name, profile.hotkey))
+                            .add_enabled(can_restore, egui::Button::new(t(lang, "復元", "Restore")))
+                            .clicked()
+                            && let Some(profile) = self.deleted_profiles.pop()
+                        {
+                            self.config.profiles.push(profile);
+                            self.selected_profile = self.config.profiles.len() - 1;
+                            self.selected_key = 0;
+                        }
+
+                        let can_remove = self.config.profiles.len() > 1;
+                        if ui
+                            .add_enabled(can_remove, egui::Button::new(t(lang, "削除", "Remove")))
                             .clicked()
                         {
-                            self.selected_profile = index;
+                            let removed = self.config.profiles.remove(self.selected_profile);
+                            self.deleted_profiles.push(removed);
+                            self.selected_profile = self.selected_profile.saturating_sub(1);
+                            self.selected_key = 0;
                         }
-                    }
+                    });
+                    },
+                );
 
-                    ui.add_space(8.0);
-                    if ui.button(t(lang, "セットを追加", "Add Set")).clicked() {
-                        let next = self.config.profiles.len() + 1;
-                        self.config.profiles.push(WheelProfile {
-                            name: t(lang, "セット ", "Set ").to_owned() + &next.to_string(),
-                            hotkey: "F1".to_owned(),
-                            direction_mode: DirectionMode::Eight,
-                            phrases: vec![String::new(); DIRECTIONS_8.len()],
+                ui.separator();
+
+                ui.allocate_ui_with_layout(
+                    Vec2::new(240.0, editor_height),
+                    Layout::top_down(Align::Min),
+                    |ui| {
+                    ui.heading(t(lang, "キー", "Keys"));
+                    ui.add_space(4.0);
+                    if let Some(profile) = self.config.profiles.get_mut(self.selected_profile) {
+                        if profile.keys.is_empty() {
+                            profile.keys.push(KeyProfile::default_lane());
+                        }
+                        self.selected_key = self.selected_key.min(profile.keys.len() - 1);
+
+                        let list_height = (ui.available_height() - 42.0).max(180.0);
+                        egui::ScrollArea::vertical()
+                            .id_salt("key_selector_scroll")
+                            .max_height(list_height)
+                            .show(ui, |ui| {
+                                for (index, key_profile) in profile.keys.iter().enumerate() {
+                                    let selected = self.selected_key == index;
+                                    let label = format!(
+                                        "{}\n{}",
+                                        key_profile.name,
+                                        if key_profile.hotkey.trim().is_empty() {
+                                            "-"
+                                        } else {
+                                            key_profile.hotkey.as_str()
+                                        }
+                                    );
+                                    if ui.selectable_label(selected, label).clicked() {
+                                        self.selected_key = index;
+                                    }
+                                }
+                            });
+
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            if ui.button(t(lang, "追加", "Add")).clicked() {
+                                let next = profile.keys.len() + 1;
+                                profile.keys.push(KeyProfile {
+                                    name: t(lang, "キー ", "Key ").to_owned() + &next.to_string(),
+                                    hotkey: "F1".to_owned(),
+                                    direction_mode: DirectionMode::Eight,
+                                    phrases: vec![String::new(); DIRECTIONS_8.len()],
+                                });
+                                self.selected_key = profile.keys.len() - 1;
+                            }
+
+                            let can_remove = profile.keys.len() > 1;
+                            if ui
+                                .add_enabled(
+                                    can_remove,
+                                    egui::Button::new(t(lang, "削除", "Remove")),
+                                )
+                                .clicked()
+                            {
+                                profile.keys.remove(self.selected_key);
+                                self.selected_key = self.selected_key.saturating_sub(1);
+                            }
                         });
-                        self.selected_profile = self.config.profiles.len() - 1;
                     }
-
-                    let can_remove = self.config.profiles.len() > 1;
-                    if ui
-                        .add_enabled(
-                            can_remove,
-                            egui::Button::new(t(lang, "選択セットを削除", "Remove Selected Set")),
-                        )
-                        .clicked()
-                    {
-                        self.config.profiles.remove(self.selected_profile);
-                        self.selected_profile = self.selected_profile.saturating_sub(1);
-                    }
-                });
+                    },
+                );
 
                 ui.separator();
 
                 if let Some(profile) = self.config.profiles.get_mut(self.selected_profile) {
-                    ui.vertical(|ui| {
-                        egui::Grid::new(format!("profile_meta_{}", self.selected_profile))
-                            .num_columns(2)
-                            .spacing([12.0, 8.0])
-                            .show(ui, |ui| {
-                                ui.label(t(lang, "名前", "Name"));
-                                ui.add_sized([260.0, 28.0], egui::TextEdit::singleline(&mut profile.name));
-                                ui.end_row();
+                    if profile.keys.is_empty() {
+                        profile.keys.push(KeyProfile::default_lane());
+                    }
+                    self.selected_key = self.selected_key.min(profile.keys.len() - 1);
+                    let profile_name = profile.name.clone();
+                    let key_name = profile.keys[self.selected_key].name.clone();
 
-                                ui.label(t(lang, "ホットキー", "Hotkey"));
-                                ui.add_sized([200.0, 28.0], egui::TextEdit::singleline(&mut profile.hotkey));
-                                if !profile.hotkey.is_empty() && keycode_from_name(&profile.hotkey).is_none() {
-                                    ui.colored_label(Color32::from_rgb(210, 80, 80), "?");
-                                }
-                                ui.end_row();
+                    egui::ScrollArea::vertical()
+                        .id_salt("settings_detail_scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.vertical(|ui| {
+                                ui.heading(format!("{profile_name} / {key_name}"));
+                                ui.add_space(6.0);
 
-                                ui.label(t(lang, "選択数", "Directions"));
-                                egui::ComboBox::from_id_salt(format!(
-                                    "direction_mode_combo_{}",
-                                    self.selected_profile
-                                ))
-                                .width(260.0)
-                                .selected_text(profile.direction_mode.label_lang(lang))
-                                .show_ui(ui, |ui| {
-                                    for mode in [
-                                        DirectionMode::Four,
-                                        DirectionMode::Six,
-                                        DirectionMode::Eight,
-                                    ] {
-                                        ui.selectable_value(
-                                            &mut profile.direction_mode,
-                                            mode,
-                                            mode.label_lang(lang),
+                                ui.label(t(lang, "プロファイル設定", "Profile Settings"));
+                                egui::Grid::new(format!("profile_meta_{}", self.selected_profile))
+                                    .num_columns(2)
+                                    .spacing([12.0, 8.0])
+                                    .show(ui, |ui| {
+                                        ui.label(t(lang, "名前", "Name"));
+                                        ui.add_sized(
+                                            [260.0, 28.0],
+                                            egui::TextEdit::singleline(&mut profile.name),
                                         );
-                                    }
-                                });
-                                ui.end_row();
-                            });
+                                        ui.end_row();
+                                    });
 
-                        ui.add_space(8.0);
-                        egui::Grid::new(format!("profile_phrases_{}", self.selected_profile))
-                            .num_columns(2)
-                            .spacing([12.0, 8.0])
-                            .show(ui, |ui| {
-                                for direction in profile.direction_mode.directions() {
-                                    ui.label(format!("{:>2}", direction.label_lang(lang)));
+                                ui.add_space(10.0);
+                                ui.label(t(lang, "対象アプリ", "Target Apps"));
+                                Self::draw_target_apps(
+                                    ui,
+                                    lang,
+                                    self.selected_profile,
+                                    profile,
+                                    &mut self.app_icon_textures,
+                                );
+
+                                ui.add_space(12.0);
+                                ui.label(t(lang, "キー設定", "Key Settings"));
+                                let key_profile = &mut profile.keys[self.selected_key];
+                                egui::Grid::new(format!(
+                                    "key_meta_{}_{}",
+                                    self.selected_profile, self.selected_key
+                                ))
+                                .num_columns(2)
+                                .spacing([12.0, 8.0])
+                                .show(ui, |ui| {
+                                    ui.label(t(lang, "名前", "Name"));
                                     ui.add_sized(
-                                        [420.0, 30.0],
-                                        egui::TextEdit::singleline(
-                                            &mut profile.phrases[direction.index()],
-                                        ),
+                                        [260.0, 28.0],
+                                        egui::TextEdit::singleline(&mut key_profile.name),
                                     );
                                     ui.end_row();
-                                }
+
+                                    ui.label(t(lang, "ホットキー", "Hotkey"));
+                                    ui.add_sized(
+                                        [200.0, 28.0],
+                                        egui::TextEdit::singleline(&mut key_profile.hotkey),
+                                    );
+                                    if !key_profile.hotkey.is_empty()
+                                        && keycode_from_name(&key_profile.hotkey).is_none()
+                                    {
+                                        ui.colored_label(Color32::from_rgb(210, 80, 80), "?");
+                                    }
+                                    ui.end_row();
+
+                                    ui.label(t(lang, "選択数", "Directions"));
+                                    egui::ComboBox::from_id_salt(format!(
+                                        "direction_mode_combo_{}_{}",
+                                        self.selected_profile, self.selected_key
+                                    ))
+                                    .width(260.0)
+                                    .selected_text(key_profile.direction_mode.label_lang(lang))
+                                    .show_ui(ui, |ui| {
+                                        for mode in [
+                                            DirectionMode::Four,
+                                            DirectionMode::Six,
+                                            DirectionMode::Eight,
+                                        ] {
+                                            ui.selectable_value(
+                                                &mut key_profile.direction_mode,
+                                                mode,
+                                                mode.label_lang(lang),
+                                            );
+                                        }
+                                    });
+                                    ui.end_row();
+                                });
+
+                                ui.add_space(12.0);
+                                ui.label(t(lang, "方向ごとの割り当て", "Direction Assignments"));
+                                egui::Grid::new(format!(
+                                    "profile_phrases_{}_{}",
+                                    self.selected_profile, self.selected_key
+                                ))
+                                .num_columns(2)
+                                .spacing([12.0, 8.0])
+                                .show(ui, |ui| {
+                                    for direction in key_profile.direction_mode.directions() {
+                                        ui.label(format!("{:>2}", direction.label_lang(lang)));
+                                        ui.add_sized(
+                                            [420.0, 30.0],
+                                            egui::TextEdit::singleline(
+                                                &mut key_profile.phrases[direction.index()],
+                                            ),
+                                        );
+                                        ui.end_row();
+                                    }
+                                });
                             });
-                    });
+                        });
                 }
-            });
+                },
+            );
         });
     }
 
@@ -1067,11 +1374,162 @@ impl CallWheelApp {
                 });
             });
     }
+
+    fn draw_preview_viewport(&mut self, ctx: &egui::Context) {
+        if !self.preview_open {
+            return;
+        }
+
+        let lang = self.config.language;
+        let title = t(lang, "ホイールプレビュー", "Wheel Preview");
+        let viewport_id = egui::ViewportId::from_hash_of("callwheel_preview_viewport");
+        let builder = egui::ViewportBuilder::default()
+            .with_title(title)
+            .with_inner_size([720.0, 720.0])
+            .with_min_inner_size([420.0, 420.0]);
+
+        let mut open = true;
+        ctx.show_viewport_immediate(viewport_id, builder, |ui, _class| {
+            if ui.input(|input| input.viewport().close_requested()) {
+                open = false;
+                return;
+            }
+
+            egui::CentralPanel::default().show_inside(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(t(lang, "ホイール半径", "Wheel Radius"));
+                    ui.add(
+                        egui::Slider::new(&mut self.config.wheel_radius, 92.0..=190.0)
+                            .suffix(" px"),
+                    );
+                    ui.label(t(lang, "選択肢サイズ", "Item Size"));
+                    ui.add(
+                        egui::Slider::new(&mut self.config.wheel_item_radius, 34.0..=78.0)
+                            .suffix(" px"),
+                    );
+                });
+
+                ui.add_space(8.0);
+
+                if let Some(snapshot) = self.preview_snapshot() {
+                    egui::ScrollArea::both()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| draw_egui_overlay_preview(ui, &snapshot));
+                }
+            });
+        });
+
+        self.preview_open = open;
+    }
+
+    fn preview_snapshot(&self) -> Option<OverlaySnapshot> {
+        let profile = self.config.profiles.get(self.selected_profile)?;
+        let key_profile = profile.keys.get(self.selected_key)?;
+        Some(OverlaySnapshot {
+            profile_name: key_profile.name.clone(),
+            phrases: key_profile.phrases.clone(),
+            origin: Pos2::ZERO,
+            selected: Some(
+                profile
+                    .keys
+                    .get(self.selected_key)?
+                    .direction_mode
+                    .directions()
+                    .get(1)
+                    .copied()
+                    .unwrap_or(Direction::Up),
+            ),
+            wheel_radius: self.config.wheel_radius,
+            wheel_item_radius: self.config.wheel_item_radius,
+            direction_mode: key_profile.direction_mode,
+            confirmed_at: None,
+            selection_animation: self.config.selection_animation,
+            language: self.config.language,
+        })
+    }
+
+    fn draw_target_apps(
+        ui: &mut egui::Ui,
+        lang: Language,
+        selected_profile: usize,
+        profile: &mut WheelProfile,
+        app_icon_textures: &mut HashMap<String, egui::TextureHandle>,
+    ) {
+        if profile.target_process_paths.is_empty() {
+            ui.label(t(
+                lang,
+                "未指定の場合は、どのアプリでもこのプロファイルが有効です。",
+                "When empty, this profile is active in every app.",
+            ));
+        }
+
+        let mut remove_index = None;
+        for index in 0..profile.target_process_paths.len() {
+            ui.horizontal(|ui| {
+                let path = profile.target_process_paths[index].clone();
+                draw_app_icon(ui, app_icon_textures, &path);
+                ui.add_sized(
+                    [360.0, 28.0],
+                    egui::TextEdit::singleline(&mut profile.target_process_paths[index])
+                        .hint_text(t(lang, "実行ファイルのパス", "Executable path")),
+                );
+                if ui.button(t(lang, "参照", "Browse")).clicked()
+                    && let Some(path) = pick_executable_path()
+                {
+                    profile.target_process_paths[index] = path;
+                }
+                if ui.button(t(lang, "削除", "Remove")).clicked() {
+                    remove_index = Some(index);
+                }
+            });
+        }
+
+        if let Some(index) = remove_index {
+            profile.target_process_paths.remove(index);
+        }
+
+        ui.horizontal(|ui| {
+            if ui.button(t(lang, "アプリを追加", "Add App")).clicked() {
+                if let Some(path) = pick_executable_path() {
+                    profile.target_process_paths.push(path);
+                } else {
+                    profile.target_process_paths.push(String::new());
+                }
+            }
+            if ui
+                .button(t(lang, "入力欄を追加", "Add Field"))
+                .on_hover_text(t(
+                    lang,
+                    "手入力したい場合に空の入力欄を追加します。",
+                    "Adds an empty field for manual entry.",
+                ))
+                .clicked()
+            {
+                profile.target_process_paths.push(String::new());
+            }
+            ui.small(format!(
+                "{} {}",
+                t(lang, "設定中:", "Targets:"),
+                profile
+                    .target_process_paths
+                    .iter()
+                    .filter(|path| !path.trim().is_empty())
+                    .count()
+            ));
+        });
+
+        ui.add_space(2.0);
+        ui.small(format!(
+            "{} #{}",
+            t(lang, "編集中のプロファイル", "Editing profile"),
+            selected_profile + 1
+        ));
+    }
 }
 
 impl eframe::App for CallWheelApp {
-    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        egui::Color32::TRANSPARENT.to_normalized_gamma_f32()
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        visuals.panel_fill.to_normalized_gamma_f32()
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -1086,6 +1544,7 @@ impl eframe::App for CallWheelApp {
         self.draw_settings(ui);
         let ctx = ui.ctx();
         hide_overlay_window();
+        self.draw_preview_viewport(ctx);
         self.draw_toast(ctx);
         ctx.request_repaint_after(Duration::from_millis(16));
     }
@@ -1095,23 +1554,218 @@ fn selection_effect_duration() -> Duration {
     Duration::from_millis(SELECTION_EFFECT_MS)
 }
 
+fn draw_egui_overlay_preview(ui: &mut egui::Ui, snapshot: &OverlaySnapshot) {
+    let outer_radius = snapshot.wheel_radius + overlay_outer_padding(snapshot.wheel_item_radius);
+    let extent_radius = snapshot.wheel_radius + overlay_extent_padding(snapshot.wheel_item_radius);
+    let size = Vec2::splat(extent_radius * 2.0);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    let center = rect.center();
+    let wheel_radius = snapshot.wheel_radius;
+    let inner_radius = 42.0;
+
+    painter.circle_filled(center, outer_radius, Color32::from_rgb(5, 12, 20));
+    painter.circle_stroke(
+        center,
+        outer_radius,
+        egui::Stroke::new(3.0, Color32::from_rgb(116, 86, 38)),
+    );
+    painter.circle_stroke(
+        center,
+        outer_radius - 7.0,
+        egui::Stroke::new(1.0, Color32::from_rgb(180, 146, 74)),
+    );
+    painter.circle_stroke(
+        center,
+        wheel_radius - 10.0,
+        egui::Stroke::new(1.0, Color32::from_rgb(55, 170, 180)),
+    );
+    painter.circle_filled(center, inner_radius, Color32::from_rgb(3, 9, 16));
+    painter.circle_stroke(
+        center,
+        inner_radius,
+        egui::Stroke::new(2.0, Color32::from_rgb(200, 158, 74)),
+    );
+    painter.text(
+        center,
+        Align2::CENTER_CENTER,
+        &snapshot.profile_name,
+        egui::FontId::proportional(15.0),
+        Color32::WHITE,
+    );
+
+    let directions = snapshot.direction_mode.directions();
+    for pass in 0..2u8 {
+        for &direction in directions {
+            let is_selected = snapshot.selected == Some(direction);
+            if (pass == 0 && is_selected) || (pass == 1 && !is_selected) {
+                continue;
+            }
+
+            let angle = direction_angle_in_mode(snapshot.direction_mode, direction).to_radians();
+            let unit = Vec2::new(angle.cos(), -angle.sin());
+            let item_pos = center + unit * wheel_radius;
+            let node_radius = if is_selected {
+                snapshot.wheel_item_radius + 5.0
+            } else {
+                snapshot.wheel_item_radius
+            };
+
+            painter.line_segment(
+                [center + unit * inner_radius, item_pos],
+                egui::Stroke::new(1.0, Color32::from_rgb(150, 118, 55)),
+            );
+
+            if is_selected && snapshot.selection_animation {
+                painter.circle_filled(item_pos, node_radius + 7.0, Color32::from_rgb(26, 196, 205));
+            }
+
+            let bg = if is_selected {
+                Color32::from_rgb(8, 78, 91)
+            } else {
+                Color32::from_rgb(12, 25, 34)
+            };
+            let fg = if is_selected {
+                Color32::from_rgb(245, 250, 255)
+            } else {
+                Color32::from_rgb(216, 226, 226)
+            };
+            let border = if is_selected {
+                Color32::from_rgb(200, 158, 74)
+            } else {
+                Color32::from_rgb(116, 86, 38)
+            };
+
+            painter.circle_filled(item_pos, node_radius, bg);
+            painter.circle_stroke(
+                item_pos,
+                node_radius,
+                egui::Stroke::new(if is_selected { 3.0 } else { 2.0 }, border),
+            );
+            painter.circle_stroke(
+                item_pos,
+                node_radius - 6.0,
+                egui::Stroke::new(1.0, Color32::from_rgb(185, 165, 105)),
+            );
+            painter.text(
+                item_pos,
+                Align2::CENTER_CENTER,
+                compact_phrase(phrase_for_direction(&snapshot.phrases, direction)),
+                egui::FontId::proportional(14.0),
+                fg,
+            );
+        }
+    }
+}
+
 fn selection_effect_progress(confirmed_at: Instant) -> f32 {
     (confirmed_at.elapsed().as_secs_f32() / selection_effect_duration().as_secs_f32())
         .clamp(0.0, 1.0)
 }
 
-fn play_select_sound() {
+fn overlay_outer_padding(item_radius: f32) -> f32 {
+    item_radius + 13.0
+}
+
+fn overlay_extent_padding(item_radius: f32) -> f32 {
+    overlay_outer_padding(item_radius) + 33.0
+}
+
+#[cfg(target_os = "windows")]
+fn ensure_koto_sound_file() -> Option<PathBuf> {
+    let path = std::env::temp_dir().join("callwheel_koto.wav");
+    if path.exists() {
+        return Some(path);
+    }
+
+    fs::write(&path, make_koto_wav()).ok()?;
+    Some(path)
+}
+
+#[cfg(target_os = "windows")]
+fn make_koto_wav() -> Vec<u8> {
+    const SAMPLE_RATE: u32 = 44_100;
+    const DURATION_SECONDS: f32 = 0.15;
+    let sample_count = (SAMPLE_RATE as f32 * DURATION_SECONDS) as usize;
+    let mut samples = Vec::with_capacity(sample_count * 2);
+
+    for i in 0..sample_count {
+        let t = i as f32 / SAMPLE_RATE as f32;
+        let attack = (t / 0.008).min(1.0);
+        let decay = (-t * 24.0).exp();
+        let thump_decay = (-t * 48.0).exp();
+        let click_decay = (-t * 85.0).exp();
+
+        let wood = (2.0 * std::f32::consts::PI * 220.0 * t).sin() * 0.48
+            + (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.28
+            + (2.0 * std::f32::consts::PI * 720.0 * t).sin() * 0.12;
+        let thump = (2.0 * std::f32::consts::PI * 128.0 * t).sin() * 0.18;
+        let click = (2.0 * std::f32::consts::PI * 1320.0 * t).sin() * 0.05;
+        let value = (wood * decay + thump * thump_decay + click * click_decay) * attack * 0.55;
+        let sample = (value.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+        samples.extend_from_slice(&sample.to_le_bytes());
+    }
+
+    let data_len = samples.len() as u32;
+    let mut wav = Vec::with_capacity(44 + samples.len());
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+    wav.extend_from_slice(b"WAVE");
+    wav.extend_from_slice(b"fmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
+    wav.extend_from_slice(&(SAMPLE_RATE * 2).to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    wav.extend_from_slice(&samples);
+    wav
+}
+
+fn play_select_sound(kind: SelectionSoundKind) {
     #[cfg(target_os = "windows")]
     {
-        thread::spawn(|| {
-            unsafe {
-                unsafe extern "system" {
-                    fn Beep(dwFreq: u32, dwDuration: u32) -> i32;
+        thread::spawn(move || unsafe {
+            unsafe extern "system" {
+                fn Beep(dwFreq: u32, dwDuration: u32) -> i32;
+            }
+            match kind {
+                SelectionSoundKind::Koto => {
+                    if let Some(path) = ensure_koto_sound_file() {
+                        let wide = wide_null(&path.to_string_lossy());
+                        let _ = PlaySoundW(PCWSTR(wide.as_ptr()), None, SND_FILENAME | SND_ASYNC);
+                    } else {
+                        Beep(440, 16);
+                    }
                 }
-                Beep(660, 35);
+                SelectionSoundKind::Subtle => {
+                    Beep(440, 16);
+                }
+                SelectionSoundKind::Soft => {
+                    Beep(520, 24);
+                }
+                SelectionSoundKind::Click => {
+                    Beep(660, 35);
+                }
+                SelectionSoundKind::Confirm => {
+                    Beep(660, 28);
+                    thread::sleep(Duration::from_millis(18));
+                    Beep(880, 42);
+                }
+                SelectionSoundKind::Alert => {
+                    Beep(880, 34);
+                    thread::sleep(Duration::from_millis(20));
+                    Beep(740, 54);
+                }
             }
         });
     }
+
+    #[cfg(not(target_os = "windows"))]
+    let _ = kind;
 }
 
 fn direction_angle_in_mode(mode: DirectionMode, direction: Direction) -> f32 {
@@ -1144,6 +1798,225 @@ fn mouse_cancel_pressed(buttons: &[bool]) -> bool {
     buttons.get(1).copied().unwrap_or(false)
         || buttons.get(2).copied().unwrap_or(false)
         || windows_right_mouse_pressed()
+}
+
+fn profile_matches_process_path(profile: &WheelProfile, foreground_process_path: &str) -> bool {
+    if !profile_has_process_targets(profile) {
+        return true;
+    }
+
+    let foreground = normalize_process_path(foreground_process_path);
+    !foreground.is_empty()
+        && profile
+            .target_process_paths
+            .iter()
+            .map(|path| normalize_process_path(path))
+            .any(|path| !path.is_empty() && path == foreground)
+}
+
+fn profile_has_process_targets(profile: &WheelProfile) -> bool {
+    profile
+        .target_process_paths
+        .iter()
+        .any(|path| !path.trim().is_empty())
+}
+
+fn normalize_process_path(path: &str) -> String {
+    path.trim()
+        .trim_matches('"')
+        .replace('/', "\\")
+        .to_lowercase()
+}
+
+#[cfg(target_os = "windows")]
+fn foreground_process_path() -> String {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd == HWND::default() {
+            return String::new();
+        }
+
+        let mut process_id = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut process_id as *mut u32));
+        if process_id == 0 {
+            return String::new();
+        }
+
+        let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) else {
+            return String::new();
+        };
+
+        let mut buffer = vec![0u16; 32768];
+        let mut size = buffer.len() as u32;
+        let result = QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_WIN32,
+            PWSTR(buffer.as_mut_ptr()),
+            &mut size,
+        );
+        let _ = CloseHandle(process);
+
+        if result.is_err() || size == 0 {
+            return String::new();
+        }
+
+        String::from_utf16_lossy(&buffer[..size as usize])
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn foreground_process_path() -> String {
+    String::new()
+}
+
+fn pick_executable_path() -> Option<String> {
+    rfd::FileDialog::new()
+        .add_filter("Executable", &["exe"])
+        .pick_file()
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+fn draw_app_icon(
+    ui: &mut egui::Ui,
+    app_icon_textures: &mut HashMap<String, egui::TextureHandle>,
+    path: &str,
+) {
+    let key = normalize_process_path(path);
+    let texture = app_icon_textures.entry(key.clone()).or_insert_with(|| {
+        let image = load_app_icon_image(path).unwrap_or_else(|| fallback_app_icon_image(path));
+        ui.ctx().load_texture(
+            format!("app_icon:{key}"),
+            image,
+            egui::TextureOptions::LINEAR,
+        )
+    });
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(26.0), egui::Sense::hover());
+    ui.painter().image(
+        texture.id(),
+        rect,
+        egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+        Color32::WHITE,
+    );
+}
+
+#[cfg(target_os = "windows")]
+fn load_app_icon_image(path: &str) -> Option<egui::ColorImage> {
+    if path.trim().is_empty() {
+        return None;
+    }
+
+    unsafe {
+        let wide = wide_null(path.trim().trim_matches('"'));
+        let mut large_icon = HICON::default();
+        let count = ExtractIconExW(
+            PCWSTR(wide.as_ptr()),
+            0,
+            Some(&mut large_icon as *mut HICON),
+            None,
+            1,
+        );
+        if count == 0 {
+            return None;
+        }
+
+        let image = icon_to_color_image(large_icon);
+        let _ = DestroyIcon(large_icon);
+        image
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn load_app_icon_image(_path: &str) -> Option<egui::ColorImage> {
+    None
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn icon_to_color_image(
+    icon: windows::Win32::UI::WindowsAndMessaging::HICON,
+) -> Option<egui::ColorImage> {
+    const SIZE: i32 = 32;
+    unsafe {
+        let screen = GetDC(None);
+        if screen.is_invalid() {
+            return None;
+        }
+
+        let hdc = CreateCompatibleDC(Some(screen));
+        let _ = ReleaseDC(None, screen);
+        if hdc.is_invalid() {
+            return None;
+        }
+
+        let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: SIZE,
+                biHeight: -SIZE,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let Ok(bitmap) = CreateDIBSection(Some(hdc), &info, DIB_RGB_COLORS, &mut bits, None, 0)
+        else {
+            let _ = windows::Win32::Graphics::Gdi::DeleteDC(hdc);
+            return None;
+        };
+
+        if bitmap.is_invalid() || bits.is_null() {
+            let _ = DeleteObject(bitmap.into());
+            let _ = windows::Win32::Graphics::Gdi::DeleteDC(hdc);
+            return None;
+        }
+
+        let old = windows::Win32::Graphics::Gdi::SelectObject(hdc, bitmap.into());
+        let drawn = DrawIconEx(hdc, 0, 0, icon, SIZE, SIZE, 0, None, DI_NORMAL);
+        let bytes = std::slice::from_raw_parts(bits as *const u8, (SIZE * SIZE * 4) as usize);
+        let mut rgba = Vec::with_capacity(bytes.len());
+        for bgra in bytes.chunks_exact(4) {
+            rgba.extend_from_slice(&[bgra[2], bgra[1], bgra[0], bgra[3]]);
+        }
+
+        let _ = windows::Win32::Graphics::Gdi::SelectObject(hdc, old);
+        let _ = DeleteObject(bitmap.into());
+        let _ = windows::Win32::Graphics::Gdi::DeleteDC(hdc);
+
+        if drawn.is_err() {
+            return None;
+        }
+
+        Some(egui::ColorImage::from_rgba_unmultiplied(
+            [SIZE as usize, SIZE as usize],
+            &rgba,
+        ))
+    }
+}
+
+fn fallback_app_icon_image(path: &str) -> egui::ColorImage {
+    const SIZE: usize = 32;
+    let seed = path.bytes().fold(0u8, |acc, byte| acc.wrapping_add(byte));
+    let accent = Color32::from_rgb(
+        70u8.wrapping_add(seed / 3),
+        110u8.wrapping_add(seed / 5),
+        150u8.wrapping_add(seed / 7),
+    );
+    let mut rgba = vec![0u8; SIZE * SIZE * 4];
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let i = (y * SIZE + x) * 4;
+            let border = x < 3 || y < 3 || x >= SIZE - 3 || y >= SIZE - 3;
+            let color = if border {
+                Color32::from_rgb(220, 224, 228)
+            } else {
+                accent
+            };
+            rgba[i..i + 4].copy_from_slice(&color.to_array());
+        }
+    }
+    egui::ColorImage::from_rgba_unmultiplied([SIZE, SIZE], &rgba)
 }
 
 fn run_output_phrase(mode: OutputMode, phrase: String, delay: (u64, u64), lang: Language) -> Toast {
@@ -1378,7 +2251,11 @@ fn draw_native_overlay(
 
         let center = Vec2::new(width as f32 / 2.0, height as f32 / 2.0);
         let wheel_radius = snapshot.wheel_radius * pixels_per_point;
-        let outer_radius = (snapshot.wheel_radius + 62.0) * pixels_per_point;
+        let item_radius = snapshot.wheel_item_radius * pixels_per_point;
+        let selected_item_radius = (snapshot.wheel_item_radius + 5.0) * pixels_per_point;
+        let outer_radius = (snapshot.wheel_radius
+            + overlay_outer_padding(snapshot.wheel_item_radius))
+            * pixels_per_point;
         let inner_radius = 42.0 * pixels_per_point;
         let effect_progress = snapshot.confirmed_at.map(selection_effect_progress);
 
@@ -1438,9 +2315,14 @@ fn draw_native_overlay(
                     continue;
                 }
 
-                let angle = direction_angle_in_mode(snapshot.direction_mode, direction).to_radians();
+                let angle =
+                    direction_angle_in_mode(snapshot.direction_mode, direction).to_radians();
                 let item_pos = center + Vec2::new(angle.cos(), -angle.sin()) * wheel_radius;
-                let node_radius = (if is_selected { 54.0 } else { 49.0 }) * pixels_per_point;
+                let node_radius = if is_selected {
+                    selected_item_radius
+                } else {
+                    item_radius
+                };
                 let bg = if is_selected {
                     if snapshot.confirmed_at.is_some() {
                         rgb(38, 130, 118)
@@ -1471,15 +2353,24 @@ fn draw_native_overlay(
                         rgb(26, 196, 205),
                     );
                     if let Some(progress) = effect_progress {
-                        let ring_radius =
-                            node_radius + 10.0 * pixels_per_point + progress * 16.0 * pixels_per_point;
+                        let ring_radius = node_radius
+                            + 10.0 * pixels_per_point
+                            + progress * 16.0 * pixels_per_point;
                         draw_native_circle_fill(
                             hdc,
                             item_pos,
-                            node_radius + 12.0 * pixels_per_point + progress * 8.0 * pixels_per_point,
+                            node_radius
+                                + 12.0 * pixels_per_point
+                                + progress * 8.0 * pixels_per_point,
                             rgb(24, 92, 92),
                         );
-                        draw_native_circle_outline(hdc, item_pos, ring_radius, rgb(248, 224, 150), 3);
+                        draw_native_circle_outline(
+                            hdc,
+                            item_pos,
+                            ring_radius,
+                            rgb(248, 224, 150),
+                            3,
+                        );
                         draw_native_circle_outline(
                             hdc,
                             item_pos,
@@ -1894,12 +2785,47 @@ fn load_config(path: &PathBuf) -> AppConfig {
 }
 
 fn normalize_config(config: &mut AppConfig) {
+    config.wheel_item_radius = config.wheel_item_radius.clamp(34.0, 78.0);
+    config.wheel_radius = config.wheel_radius.clamp(92.0, 190.0);
     let legacy_direction_mode = config.legacy_direction_mode.take();
     for profile in &mut config.profiles {
-        if let Some(direction_mode) = legacy_direction_mode {
-            profile.direction_mode = direction_mode;
+        profile
+            .target_process_paths
+            .retain(|path| !path.trim().is_empty());
+        for path in &mut profile.target_process_paths {
+            *path = path.trim().trim_matches('"').to_owned();
         }
-        normalize_phrases(&mut profile.phrases);
+        profile
+            .target_process_paths
+            .sort_by_key(|path| normalize_process_path(path));
+        profile
+            .target_process_paths
+            .dedup_by(|a, b| normalize_process_path(a) == normalize_process_path(b));
+
+        if profile.keys.is_empty() {
+            let mut key_profile = KeyProfile {
+                name: profile.name.clone(),
+                hotkey: profile.hotkey.clone(),
+                direction_mode: profile.direction_mode,
+                phrases: std::mem::take(&mut profile.phrases),
+            };
+            if key_profile.hotkey.is_empty() {
+                key_profile.hotkey = "F1".to_owned();
+            }
+            if key_profile.phrases.is_empty() {
+                key_profile.phrases = vec![String::new(); DIRECTIONS_8.len()];
+            }
+            profile.keys.push(key_profile);
+        }
+
+        if let Some(direction_mode) = legacy_direction_mode {
+            for key_profile in &mut profile.keys {
+                key_profile.direction_mode = direction_mode;
+            }
+        }
+        for key_profile in &mut profile.keys {
+            normalize_phrases(&mut key_profile.phrases);
+        }
     }
 }
 
@@ -2039,8 +2965,48 @@ mod tests {
             config
                 .profiles
                 .iter()
-                .all(|profile| profile.direction_mode == DirectionMode::Four)
+                .flat_map(|profile| profile.keys.iter())
+                .all(|key_profile| key_profile.direction_mode == DirectionMode::Four)
         );
+    }
+
+    #[test]
+    fn blank_target_apps_keep_profile_global() {
+        let profile = WheelProfile::default_game();
+
+        assert!(profile_matches_process_path(&profile, ""));
+        assert!(profile_matches_process_path(
+            &profile,
+            "C:\\Games\\Game.exe"
+        ));
+    }
+
+    #[test]
+    fn target_app_matches_by_normalized_full_path() {
+        let mut profile = WheelProfile::default_game();
+        profile
+            .target_process_paths
+            .push("C:\\Games\\League\\League.exe".to_owned());
+
+        assert!(profile_matches_process_path(
+            &profile,
+            "c:/games/league/LEAGUE.exe"
+        ));
+        assert!(!profile_matches_process_path(
+            &profile,
+            "C:\\Games\\Valorant\\VALORANT.exe"
+        ));
+    }
+
+    #[test]
+    fn process_target_detects_non_blank_values() {
+        let mut profile = WheelProfile::default_game();
+        assert!(!profile_has_process_targets(&profile));
+
+        profile
+            .target_process_paths
+            .push("  C:\\Game.exe  ".to_owned());
+        assert!(profile_has_process_targets(&profile));
     }
 }
 
@@ -2074,106 +3040,21 @@ fn install_japanese_font(ctx: &egui::Context) {
 const APP_ICON_SIZE: usize = 64;
 
 fn app_icon() -> egui::IconData {
-    let mut rgba = Vec::with_capacity(APP_ICON_SIZE * APP_ICON_SIZE * 4);
-    let size = APP_ICON_SIZE as f32;
-    for y in 0..APP_ICON_SIZE {
-        for x in 0..APP_ICON_SIZE {
-            let (r, g, b, a) = app_icon_pixel(x as f32, y as f32, size);
-            rgba.extend_from_slice(&[r, g, b, a]);
-        }
-    }
+    let source = image::load_from_memory(include_bytes!("../assets/app_icon.png"))
+        .expect("load embedded app icon")
+        .into_rgba8();
+    let resized = image::imageops::resize(
+        &source,
+        APP_ICON_SIZE as u32,
+        APP_ICON_SIZE as u32,
+        image::imageops::FilterType::Lanczos3,
+    );
+
     egui::IconData {
-        rgba,
+        rgba: resized.into_raw(),
         width: APP_ICON_SIZE as u32,
         height: APP_ICON_SIZE as u32,
     }
-}
-
-fn app_icon_pixel(x: f32, y: f32, size: f32) -> (u8, u8, u8, u8) {
-    let center = (size - 1.0) * 0.5;
-    let dx = x - center;
-    let dy = y - center;
-    let dist = (dx * dx + dy * dy).sqrt();
-
-    let outer = size * 0.49;
-    let ring_outer = size * 0.43;
-    let ring_inner = size * 0.31;
-    let core = size * 0.20;
-
-    let alpha = smooth_fill(outer - dist, size * 0.018);
-    if alpha <= 0.001 {
-        return (0, 0, 0, 0);
-    }
-
-    let mut r = 8.0;
-    let mut g = 16.0;
-    let mut b = 28.0;
-
-    let ring_t = smooth_step(ring_outer, ring_inner, dist);
-    r = mix(12.0, r, ring_t);
-    g = mix(148.0, g, ring_t);
-    b = mix(208.0, b, ring_t);
-
-    let edge = smooth_band(
-        dist,
-        outer - size * 0.032,
-        outer - size * 0.005,
-        size * 0.01,
-    );
-    r = mix(r, 86.0, edge);
-    g = mix(g, 236.0, edge);
-    b = mix(b, 245.0, edge);
-
-    let core_t = smooth_fill(core - dist, size * 0.015);
-    r = mix(r, 5.0, core_t);
-    g = mix(g, 10.0, core_t);
-    b = mix(b, 20.0, core_t);
-
-    let line_width = size * 0.07;
-    let slash = (dx + dy * 0.85).abs();
-    let slash_t = smooth_fill(line_width - slash, size * 0.015);
-    r = mix(r, 250.0, slash_t);
-    g = mix(g, 250.0, slash_t);
-    b = mix(b, 255.0, slash_t);
-
-    let tip_x = center + size * 0.20;
-    let tip_y = center - size * 0.22;
-    let tdx = x - tip_x;
-    let tdy = y - tip_y;
-    let tip_d = (tdx * tdx + tdy * tdy).sqrt();
-    let tip_t = smooth_fill(size * 0.09 - tip_d, size * 0.02);
-    r = mix(r, 120.0, tip_t);
-    g = mix(g, 245.0, tip_t);
-    b = mix(b, 255.0, tip_t);
-
-    (
-        r.round() as u8,
-        g.round() as u8,
-        b.round() as u8,
-        (alpha * 255.0).round() as u8,
-    )
-}
-
-fn mix(a: f32, b: f32, t: f32) -> f32 {
-    a + (b - a) * t.clamp(0.0, 1.0)
-}
-
-fn smooth_fill(value: f32, feather: f32) -> f32 {
-    if feather <= 0.0 {
-        return if value >= 0.0 { 1.0 } else { 0.0 };
-    }
-    ((value / feather) * 0.5 + 0.5).clamp(0.0, 1.0)
-}
-
-fn smooth_step(edge0: f32, edge1: f32, x: f32) -> f32 {
-    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
-
-fn smooth_band(x: f32, min: f32, max: f32, feather: f32) -> f32 {
-    let enter = smooth_fill(x - min, feather);
-    let leave = 1.0 - smooth_fill(x - max, feather);
-    (enter * leave).clamp(0.0, 1.0)
 }
 
 fn main() -> eframe::Result {
@@ -2184,8 +3065,7 @@ fn main() -> eframe::Result {
             .with_title("CallWheel")
             .with_inner_size([760.0, 520.0])
             .with_min_inner_size([680.0, 460.0])
-            .with_icon(app_icon())
-            .with_transparent(true),
+            .with_icon(app_icon()),
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };

@@ -19,6 +19,7 @@ Press and hold a hotkey, swipe in a direction, and release to copy/type your phr
 - **Clipboard & direct input** — Copy to clipboard, type via `SendInput`, or both
 - **Configurable hotkeys** — Assign any key (A–Z, 0–9, F1–F12, Space, Enter, Ctrl, Shift, Alt, etc.)
 - **Multiple profiles** — Create named sets with different hotkeys and phrases
+- **Game-specific profiles** — Limit a profile to a game/window title so it only activates while that game is focused
 - **Selection sound & animation** — Optional audio/visual feedback
 - **Bilingual UI** — Japanese and English supported, switchable from settings
 - **Per-monitor DPI aware** — Renders sharply on high-DPI displays
@@ -27,9 +28,10 @@ Press and hold a hotkey, swipe in a direction, and release to copy/type your phr
 
 1. Run the application (egui settings window opens)
 2. Configure your profiles: assign a hotkey and enter phrases for each direction
-3. Keep the app running in the background
-4. In any game or application, **hold the hotkey** → swipe mouse in a direction → **release**
-5. The selected phrase is sent to clipboard, typed, or both
+3. Optional: enter part of a game window title in **Game Window** to make that profile active only while that game is focused
+4. Keep the app running in the background
+5. In any game or application, **hold the hotkey** → swipe mouse in a direction → **release**
+6. The selected phrase is sent to clipboard, typed, or both
 
 #### Example (League of Legends)
 
@@ -86,6 +88,7 @@ Press the **Save** button in the UI to persist changes.
 - **クリップボード & 直接入力** — クリップボードにコピー、`SendInput` で入力、またはその両方
 - **自由なホットキー割り当て** — A–Z, 0–9, F1–F12, Space, Enter, Ctrl, Shift, Alt など任意のキーを割り当て可能
 - **複数プロファイル** — 名前付きセットを作成し、ホットキーとフレーズを設定
+- **ゲーム別プロファイル** — ゲーム / ウィンドウタイトルを指定すると、そのゲームが前面の時だけ有効化
 - **選択サウンド & アニメーション** — オプションの音声・視覚フィードバック
 - **二言語UI** — 日本語と英語に対応、設定画面から切替可能
 - **DPI対応** — 高DPIディスプレイでもシャープに表示
@@ -94,9 +97,10 @@ Press the **Save** button in the UI to persist changes.
 
 1. アプリを起動（egui設定ウィンドウが開きます）
 2. プロファイルを設定：ホットキーと各方向の定型文を入力
-3. アプリを起動したままバックグラウンドで待機
-4. ゲームなどで **ホットキーを長押し** → マウスをスワイプ → **キーを離す**
-5. 選択した定型文がクリップボードにコピー / 入力されます
+3. 必要に応じて **ゲームウィンドウ** にゲームのウィンドウタイトルの一部を入力し、そのゲーム中だけ有効化
+4. アプリを起動したままバックグラウンドで待機
+5. ゲームなどで **ホットキーを長押し** → マウスをスワイプ → **キーを離す**
+6. 選択した定型文がクリップボードにコピー / 入力されます
 
 #### League of Legends での例
 

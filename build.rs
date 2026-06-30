@@ -1,8 +1,12 @@
 use std::{env, fs, path::PathBuf};
 
+use image::{RgbaImage, imageops::FilterType};
+
 const ICON_SIZES: [usize; 7] = [16, 24, 32, 48, 64, 128, 256];
 
 fn main() {
+    println!("cargo:rerun-if-changed=assets/app_icon.png");
+
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
@@ -19,9 +23,10 @@ fn main() {
 }
 
 fn make_icon() -> Vec<u8> {
+    let source = load_source_icon();
     let images: Vec<Vec<u8>> = ICON_SIZES
         .iter()
-        .map(|&size| make_icon_image(size))
+        .map(|&size| make_icon_image(&source, size))
         .collect();
     let entry_count = images.len();
     let dir_size = 6 + entry_count * 16;
@@ -51,7 +56,14 @@ fn make_icon() -> Vec<u8> {
     ico
 }
 
-fn make_icon_image(size: usize) -> Vec<u8> {
+fn load_source_icon() -> RgbaImage {
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("manifest dir"));
+    image::open(manifest_dir.join("assets").join("app_icon.png"))
+        .expect("load assets/app_icon.png")
+        .into_rgba8()
+}
+
+fn make_icon_image(source: &RgbaImage, size: usize) -> Vec<u8> {
     let width = size;
     let height = size;
     let xor_bytes = width * height * 4;
@@ -72,100 +84,15 @@ fn make_icon_image(size: usize) -> Vec<u8> {
     data.extend_from_slice(&(0u32).to_le_bytes());
     data.extend_from_slice(&(0u32).to_le_bytes());
 
+    let resized = image::imageops::resize(source, size as u32, size as u32, FilterType::Lanczos3);
     for y in (0..height).rev() {
         for x in 0..width {
-            let (r, g, b, a) = icon_pixel(x as f32, y as f32, size as f32);
+            let pixel = resized.get_pixel(x as u32, y as u32).0;
+            let [r, g, b, a] = pixel;
             data.extend_from_slice(&[b, g, r, a]);
         }
     }
 
     data.resize(image_bytes, 0);
     data
-}
-
-fn icon_pixel(x: f32, y: f32, size: f32) -> (u8, u8, u8, u8) {
-    let center = (size - 1.0) * 0.5;
-    let dx = x - center;
-    let dy = y - center;
-    let dist = (dx * dx + dy * dy).sqrt();
-
-    let outer = size * 0.49;
-    let ring_outer = size * 0.43;
-    let ring_inner = size * 0.31;
-    let core = size * 0.20;
-
-    let alpha = smooth_fill(outer - dist, size * 0.018);
-    if alpha <= 0.001 {
-        return (0, 0, 0, 0);
-    }
-
-    let mut r = 8.0;
-    let mut g = 16.0;
-    let mut b = 28.0;
-
-    let ring_t = smooth_step(ring_outer, ring_inner, dist);
-    r = mix(12.0, r, ring_t);
-    g = mix(148.0, g, ring_t);
-    b = mix(208.0, b, ring_t);
-
-    let edge = smooth_band(
-        dist,
-        outer - size * 0.032,
-        outer - size * 0.005,
-        size * 0.01,
-    );
-    r = mix(r, 86.0, edge);
-    g = mix(g, 236.0, edge);
-    b = mix(b, 245.0, edge);
-
-    let core_t = smooth_fill(core - dist, size * 0.015);
-    r = mix(r, 5.0, core_t);
-    g = mix(g, 10.0, core_t);
-    b = mix(b, 20.0, core_t);
-
-    let line_width = size * 0.07;
-    let slash = (dx + dy * 0.85).abs();
-    let slash_t = smooth_fill(line_width - slash, size * 0.015);
-    r = mix(r, 250.0, slash_t);
-    g = mix(g, 250.0, slash_t);
-    b = mix(b, 255.0, slash_t);
-
-    let tip_x = center + size * 0.20;
-    let tip_y = center - size * 0.22;
-    let tdx = x - tip_x;
-    let tdy = y - tip_y;
-    let tip_d = (tdx * tdx + tdy * tdy).sqrt();
-    let tip_t = smooth_fill(size * 0.09 - tip_d, size * 0.02);
-    r = mix(r, 120.0, tip_t);
-    g = mix(g, 245.0, tip_t);
-    b = mix(b, 255.0, tip_t);
-
-    (
-        r.round() as u8,
-        g.round() as u8,
-        b.round() as u8,
-        (alpha * 255.0).round() as u8,
-    )
-}
-
-fn mix(a: f32, b: f32, t: f32) -> f32 {
-    a + (b - a) * t.clamp(0.0, 1.0)
-}
-
-fn smooth_fill(value: f32, feather: f32) -> f32 {
-    if feather <= 0.0 {
-        return if value >= 0.0 { 1.0 } else { 0.0 };
-    }
-    ((value / feather) * 0.5 + 0.5).clamp(0.0, 1.0)
-}
-
-fn smooth_step(edge0: f32, edge1: f32, x: f32) -> f32 {
-    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
-
-fn smooth_band(x: f32, min: f32, max: f32, feather: f32) -> f32 {
-    let enter = smooth_fill(x - min, feather);
-    let leave = 1.0 - smooth_fill(x - max, feather);
-    (enter * leave).clamp(0.0, 1.0)
 }
